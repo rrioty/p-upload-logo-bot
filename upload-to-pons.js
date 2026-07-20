@@ -103,11 +103,15 @@ async function uploadTokenImage(imagePath, { headless = true, timeoutMs = 60000 
     const base64 = fileBuffer.toString('base64');
     console.log(`   файл: ${fileName}, ${fileBuffer.length} байт, mime=${mime}`);
 
-    // Способ 1: стандартный setInputFiles
-    await fileInput.setInputFiles(absolutePath);
+    // КРИТИЧНО: вешаем listener на ответ ДО того, как триггернем аплоад.
+    // Иначе если ответ придёт быстрее, чем мы дойдём до waitForResponse — мы его пропустим.
+    const responsePromise = page.waitForResponse(
+      (r) => r.url() === UPLOAD_ENDPOINT && r.request().method() === 'POST',
+      { timeout: timeoutMs }
+    );
 
-    // Способ 2 (страховка): через DataTransfer + dispatchEvent,
-    // чтобы гарантированно триггернуть onChange у React-обёртки
+    // Устанавливаем файл ТОЛЬКО через ручной DataTransfer + dispatchEvent —
+    // это надёжнее, чем setInputFiles, для React-форм, и не создаёт двойного события
     await page.evaluate(async ({ base64, fileName, mime, selector }) => {
       const input = document.querySelector(selector);
       if (!input) return { ok: false, reason: 'no input in DOM' };
@@ -132,10 +136,7 @@ async function uploadTokenImage(imagePath, { headless = true, timeoutMs = 60000 
     let capturedUrl = null;
     let capturedCid = null;
     try {
-      const res = await page.waitForResponse(
-        (r) => r.url() === UPLOAD_ENDPOINT && r.request().method() === 'POST',
-        { timeout: timeoutMs }
-      );
+      const res = await responsePromise;
       const status = res.status();
       console.log('   статус ответа:', status);
 
@@ -158,8 +159,13 @@ async function uploadTokenImage(imagePath, { headless = true, timeoutMs = 60000 
     } catch (waitErr) {
       if (waitErr.debugDir) throw waitErr;
       const dir = await saveDebug('no-upload-response');
-      console.error('   запросы к /api за сессию:', requestLog);
-      const e = new Error(`Не дождался POST на ${UPLOAD_ENDPOINT}: ${waitErr.message}`);
+      console.error('   ВСЕ запросы к /api за сессию:');
+      requestLog.forEach((line) => console.error('     ', line));
+      const alreadyDone = requestLog.some((l) => l.includes(UPLOAD_ENDPOINT) && l.startsWith('←'));
+      const hint = alreadyDone
+        ? 'Запрос УЖЕ прошёл до того, как listener подключился. Нужно вешать waitForResponse ДО setInputFiles.'
+        : 'Запрос вообще не ушёл. Возможно, форма считает файл невалидным.';
+      const e = new Error(`Не дождался POST на ${UPLOAD_ENDPOINT}. ${hint}`);
       e.debugDir = dir;
       throw e;
     }
