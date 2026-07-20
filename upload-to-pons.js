@@ -1,35 +1,18 @@
-/**
- * Загружает изображение токена через форму на ponsfamily.com/launchpad/create
- * и возвращает ссылку на файл в IPFS.
- *
- * Возвращает { uri, cid } — например:
- *   { uri: "ipfs://bafkrei...", cid: "bafkrei..." }
- *
- * Если что-то ломается — сохраняет диагностику (скриншот + html + логи запросов)
- * в /tmp/debug-<timestamp>/, путь возвращается в поле err.debugDir.
- */
-
 const { chromium } = require('playwright');
 const path = require('path');
 const fs = require('fs');
-const os = require('os');
 
 const CREATE_PAGE_URL = 'https://ponsfamily.com/launchpad/create';
 const UPLOAD_ENDPOINT = 'https://ponsfamily.com/api/ipfs/image';
 
-const SELECTORS = {
-  fileInput: 'input.launchpad-file-input',
-  uploadThumb: '.launchpad-upload-thumb img',
-};
+const SELECTORS = { fileInput: 'input.launchpad-file-input' };
 
-async function uploadTokenImage(imagePath, { headless = true, timeoutMs = 45000 } = {}) {
+async function uploadTokenImage(imagePath, { headless = true, timeoutMs = 60000 } = {}) {
   const browser = await chromium.launch({
     headless,
-    // важно на Render/в контейнере — иначе Chromium иногда падает при старте
     args: ['--no-sandbox', '--disable-setuid-sandbox'],
   });
   const context = await browser.newContext({
-    // прикинемся обычным браузером, не headless-строкой User-Agent
     userAgent:
       'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36',
     viewport: { width: 1440, height: 900 },
@@ -37,7 +20,6 @@ async function uploadTokenImage(imagePath, { headless = true, timeoutMs = 45000 
   });
   const page = await context.newPage();
 
-  // логируем всё, что происходит — потом видно в логах Render
   const requestLog = [];
   page.on('request', (req) => {
     if (req.url().includes('ponsfamily.com/api')) {
@@ -64,22 +46,18 @@ async function uploadTokenImage(imagePath, { headless = true, timeoutMs = 45000 
   try {
     console.log('1) Открываю страницу…');
     await page.goto(CREATE_PAGE_URL, { waitUntil: 'domcontentloaded', timeout: timeoutMs });
-
-    // Даём странице пожить — вдруг Cloudflare-challenge, вдруг гидрация Next.js
     await page.waitForLoadState('networkidle', { timeout: timeoutMs }).catch(() => {});
     console.log('   title:', await page.title());
 
-    // Проверим, что мы не застряли на challenge Cloudflare
     const bodyText = await page.locator('body').innerText().catch(() => '');
     if (/just a moment|checking your browser|cloudflare/i.test(bodyText)) {
       const dir = await saveDebug('cf-challenge');
-      const e = new Error('Cloudflare показывает challenge — headless не пропустили');
+      const e = new Error('Cloudflare показывает challenge');
       e.debugDir = dir;
       throw e;
     }
 
     console.log('2) Ищу чекбокс согласия…');
-    // Пробуем несколько вариантов, потому что в React часто это кастомный элемент
     const checkboxCandidates = [
       page.getByRole('checkbox'),
       page.locator('input[type=checkbox]'),
@@ -92,13 +70,11 @@ async function uploadTokenImage(imagePath, { headless = true, timeoutMs = 45000 
       if (count > 0) {
         try {
           await cand.first().check({ force: true, timeout: 3000 });
-          console.log('   чекбокс отмечен через', await cand.first().evaluate((el) => el.outerHTML.slice(0, 120)));
           checked = true;
           break;
         } catch {
           try {
             await cand.first().click({ force: true, timeout: 3000 });
-            console.log('   чекбокс кликнут (не check) через', await cand.first().evaluate((el) => el.outerHTML.slice(0, 120)));
             checked = true;
             break;
           } catch {}
@@ -107,17 +83,21 @@ async function uploadTokenImage(imagePath, { headless = true, timeoutMs = 45000 
     }
     if (!checked) {
       const dir = await saveDebug('no-checkbox');
-      const e = new Error('Не нашёл чекбокс согласия. Проверьте screen.png и page.html в debug-папке.');
+      const e = new Error('Не нашёл чекбокс согласия');
       e.debugDir = dir;
       throw e;
     }
+    console.log('   чекбокс отмечен');
+
+    // маленькая пауза — иногда чекбокс отправляет запрос на бэк, который выдаёт токен
+    await page.waitForTimeout(1000);
 
     console.log('3) Ищу input[type=file] и загружаю файл…');
     const fileInput = page.locator(SELECTORS.fileInput);
     const fileInputCount = await fileInput.count();
     if (fileInputCount === 0) {
       const dir = await saveDebug('no-file-input');
-      const e = new Error(`Не нашёл ${SELECTORS.fileInput}. Возможно, чекбокс не активировал форму.`);
+      const e = new Error(`Не нашёл ${SELECTORS.fileInput}`);
       e.debugDir = dir;
       throw e;
     }
@@ -128,25 +108,41 @@ async function uploadTokenImage(imagePath, { headless = true, timeoutMs = 45000 
     let capturedUrl = null;
     let capturedCid = null;
     try {
+      // Ловим ЛЮБОЙ ответ (включая 4xx/5xx), не только успешные
       const res = await page.waitForResponse(
         (r) => r.url() === UPLOAD_ENDPOINT && r.request().method() === 'POST',
         { timeout: timeoutMs }
       );
-      console.log('   получен ответ, статус', res.status());
-      const bodyText = await res.text();
-      console.log('   тело ответа:', bodyText.slice(0, 500));
-      if (res.status() >= 400) {
-        const dir = await saveDebug('upload-http-error');
-        const e = new Error(`Upload вернул ${res.status()}: ${bodyText.slice(0, 200)}`);
+      const status = res.status();
+      console.log('   статус ответа:', status);
+
+      const responseHeaders = res.headers();
+      console.log('   заголовки ответа:', JSON.stringify(responseHeaders, null, 2));
+
+      const requestHeaders = res.request().headers();
+      console.log('   заголовки запроса:', JSON.stringify(requestHeaders, null, 2));
+
+      const bodyText = await res.text().catch(() => '<не удалось прочитать тело>');
+      console.log('   тело ответа:', bodyText.slice(0, 1000));
+
+      if (status >= 400) {
+        const dir = await saveDebug(`upload-${status}`);
+        // сохраняем полное тело ответа и заголовки отдельно
+        fs.writeFileSync(`${dir}/response-body.txt`, bodyText);
+        fs.writeFileSync(`${dir}/response-headers.json`, JSON.stringify(responseHeaders, null, 2));
+        fs.writeFileSync(`${dir}/request-headers.json`, JSON.stringify(requestHeaders, null, 2));
+        const e = new Error(`Upload вернул ${status}. Тело: ${bodyText.slice(0, 300)}`);
         e.debugDir = dir;
         throw e;
       }
+
       try {
         const json = JSON.parse(bodyText);
         capturedCid = json.cid || null;
         capturedUrl = json.uri || (json.cid ? `ipfs://${json.cid}` : null);
       } catch {}
     } catch (waitErr) {
+      if (waitErr.debugDir) throw waitErr; // уже наша обёрнутая ошибка
       const dir = await saveDebug('no-upload-response');
       console.error('   запросы к /api за сессию:', requestLog);
       const e = new Error(`Не дождался POST на ${UPLOAD_ENDPOINT}: ${waitErr.message}`);
