@@ -24,19 +24,129 @@ const path = require('path');
 
 const CREATE_PAGE_URL = 'https://ponsfamily.com/launchpad/create';
 
-// Селекторы взяты из devtools-инспекции страницы (актуально на 2026-07-20).
-// Если верстка поменяется — их нужно будет перепроверить.
 const SELECTORS = {
-  // сам чекбокс/лейбл согласия на модерацию — рядом с загрузчиком,
-  // на скрине текст "I understand that selected artwork will be moderated..."
   consentCheckbox: 'text=I understand that selected artwork will be moderated',
-  fileInput: 'input.launchpad-file-input',
-  // после успешной загрузки на месте плейсхолдера обычно появляется <img> с превью
-  uploadThumb: '.launchpad-upload-thumb img',
-  // класс на label меняется с "is-ready" на что-то вроде "is-done"/"has-image" после загрузки —
-  // это нужно перепроверить вручную, см. TODO ниже
-  uploadLabel: 'label.launchpad-upload',
+  fileInput: 'input[type="file"], input.launchpad-file-input',
+  uploadThumb: '.launchpad-upload-thumb img, label.launchpad-upload img, img[src]',
 };
+
+const UPLOAD_RESPONSE_URL_HINTS = [
+  '/api/',
+  '/ipfs',
+  '/upload',
+  '/image',
+  '/file',
+  '/media',
+  'pinata',
+  'cloudflare',
+  'r2',
+  's3',
+];
+
+const IPFS_URI_RE = /ipfs:\/\/[^\s"'<>),}]+/i;
+const IPFS_GATEWAY_RE = /https?:\/\/[^\s"'<>),}]+\/ipfs\/([a-z0-9]+)[^\s"'<>),}]*/i;
+const CID_RE = /\b(?:bafy|bafk|bagi|Qm)[a-z0-9]{20,}\b/i;
+
+function extractUploadResult(value, seen = new Set()) {
+  if (!value) {
+    return { uri: null, cid: null };
+  }
+
+  if (typeof value === 'string') {
+    const ipfsUri = value.match(IPFS_URI_RE)?.[0] || null;
+    if (ipfsUri) {
+      return { uri: ipfsUri, cid: ipfsUri.replace(/^ipfs:\/\//i, '').split(/[/?#]/)[0] };
+    }
+
+    const gatewayMatch = value.match(IPFS_GATEWAY_RE);
+    if (gatewayMatch) {
+      return { uri: value, cid: gatewayMatch[1] };
+    }
+
+    const cid = value.match(CID_RE)?.[0] || null;
+    return { uri: cid ? `ipfs://${cid}` : null, cid };
+  }
+
+  if (typeof value !== 'object' || seen.has(value)) {
+    return { uri: null, cid: null };
+  }
+  seen.add(value);
+
+  const preferredKeys = [
+    'uri',
+    'url',
+    'image',
+    'imageUrl',
+    'src',
+    'cid',
+    'Hash',
+    'hash',
+    'IpfsHash',
+    'ipfsHash',
+  ];
+
+  for (const key of preferredKeys) {
+    if (Object.prototype.hasOwnProperty.call(value, key)) {
+      const result = extractUploadResult(value[key], seen);
+      if (result.uri) {
+        return result;
+      }
+    }
+  }
+
+  for (const nested of Object.values(value)) {
+    const result = extractUploadResult(nested, seen);
+    if (result.uri) {
+      return result;
+    }
+  }
+
+  return { uri: null, cid: null };
+}
+
+function isLikelyUploadResponse(res) {
+  const request = res.request();
+  const url = res.url().toLowerCase();
+  const resourceType = request.resourceType();
+
+  return (
+    res.status() < 400 &&
+    ['fetch', 'xhr'].includes(resourceType) &&
+    UPLOAD_RESPONSE_URL_HINTS.some((hint) => url.includes(hint))
+  );
+}
+
+async function readUploadResponse(res) {
+  const contentType = (res.headers()['content-type'] || '').toLowerCase();
+
+  if (contentType.includes('application/json')) {
+    return extractUploadResult(await res.json());
+  }
+
+  if (!contentType || contentType.includes('text/') || contentType.includes('javascript')) {
+    const body = await res.text();
+    try {
+      return extractUploadResult(JSON.parse(body));
+    } catch {
+      return extractUploadResult(body);
+    }
+  }
+
+  return { uri: null, cid: null };
+}
+
+async function waitForCapturedUpload(getCapturedUpload, timeoutMs) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    const result = await getCapturedUpload();
+    if (result.uri) {
+      return result;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+
+  return { uri: null, cid: null };
+}
 
 async function uploadTokenImage(imagePath, { headless = true, timeoutMs = 30000 } = {}) {
   const browser = await chromium.launch({ headless });
@@ -48,7 +158,6 @@ async function uploadTokenImage(imagePath, { headless = true, timeoutMs = 30000 
     // 1. Согласие на модерацию/публичную загрузку
     const consent = page.locator(SELECTORS.consentCheckbox).first();
     if (await consent.count() > 0) {
-      // если это чекбокс рядом с текстом — кликаем именно по input, а не по тексту
       const checkboxNearText = page.locator('input[type=checkbox]').first();
       if (await checkboxNearText.count() > 0) {
         await checkboxNearText.check({ force: true }).catch(() => consent.click());
@@ -57,57 +166,50 @@ async function uploadTokenImage(imagePath, { headless = true, timeoutMs = 30000 
       }
     }
 
-    // 2. Загружаем файл
-    const fileInput = page.locator(SELECTORS.fileInput);
+    const fileInput = page.locator(SELECTORS.fileInput).first();
     await fileInput.waitFor({ state: 'attached', timeout: timeoutMs });
+
+    let capturedUpload = Promise.resolve({ uri: null, cid: null });
+    page.on('response', (res) => {
+      if (!isLikelyUploadResponse(res)) {
+        return;
+      }
+
+      capturedUpload = capturedUpload.then(async (previous) => {
+        if (previous.uri) {
+          return previous;
+        }
+
+        return readUploadResponse(res).catch(() => ({ uri: null, cid: null }));
+      });
+    });
+
     await fileInput.setInputFiles(path.resolve(imagePath));
 
-    // 3. Ждём, пока бэкенд обработает файл — либо появится превью,
-    //    либо в сетевых запросах пройдёт ответ от аплоад-эндпоинта.
-    //    Ловим сетевой ответ параллельно с ожиданием превью — что раньше сработает.
-    let capturedUrl = null;
-    let capturedCid = null;
+    const networkPromise = waitForCapturedUpload(() => capturedUpload, timeoutMs);
+    const thumbPromise = page.locator(SELECTORS.uploadThumb)
+      .first()
+      .waitFor({ state: 'visible', timeout: timeoutMs })
+      .then(async () => extractUploadResult(await page.locator(SELECTORS.uploadThumb).first().getAttribute('src')))
+      .catch(() => ({ uri: null, cid: null }));
 
-    // Реальный эндпоинт, найденный через DevTools Network:
-    // POST https://ponsfamily.com/api/ipfs/image (multipart/form-data)
-    // Ответ вида: { "cid": "bafkrei...", "uri": "ipfs://bafkrei..." }
-    const responsePromise = page.waitForResponse(
-      (res) =>
-        res.url() === 'https://ponsfamily.com/api/ipfs/image' &&
-        res.request().method() === 'POST' &&
-        res.status() < 400,
-      { timeout: timeoutMs }
-    ).then(async (res) => {
-      try {
-        const json = await res.json();
-        capturedCid = json.cid || null;
-        capturedUrl = json.uri || (json.cid ? `ipfs://${json.cid}` : null);
-      } catch {
-        // ответ не JSON — пропускаем, попробуем достать ссылку из DOM
-      }
-    }).catch(() => null);
+    let { uri, cid } = await Promise.race([networkPromise, thumbPromise]);
 
-    await Promise.race([
-      responsePromise,
-      page.locator(SELECTORS.uploadThumb).waitFor({ state: 'visible', timeout: timeoutMs }),
-    ]);
-
-    // 4. Если ссылку не поймали из сетевого ответа — пробуем достать из DOM
-    if (!capturedUrl) {
-      const thumb = page.locator(SELECTORS.uploadThumb);
-      if (await thumb.count() > 0) {
-        capturedUrl = await thumb.getAttribute('src');
-      }
+    if (!uri) {
+      ({ uri, cid } = await networkPromise);
+    }
+    if (!uri) {
+      ({ uri, cid } = await thumbPromise);
     }
 
-    if (!capturedUrl) {
+    if (!uri) {
       throw new Error(
         'Не удалось поймать ссылку на изображение. ' +
-        'Нужно посмотреть реальный сетевой запрос (Network tab) и поправить SELECTORS/парсинг ответа.'
+        'Не найден IPFS URI/CID ни в ответах upload API, ни в src превью.'
       );
     }
 
-    return { uri: capturedUrl, cid: capturedCid };
+    return { uri, cid };
   } finally {
     await browser.close();
   }
