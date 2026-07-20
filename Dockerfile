@@ -1,6 +1,6 @@
 # Официальный образ Microsoft уже содержит Chromium/Firefox/WebKit
 # и все системные библиотеки для headless-запуска — не нужен apt-get вручную.
-FROM mcr.microsoft.com/playwright:v1.47.0-jammy
+FROM mcr.microsoft.com/playwright:v1.61.1-jammy
 
 WORKDIR /app
 
