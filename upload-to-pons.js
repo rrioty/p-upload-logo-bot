@@ -169,12 +169,14 @@ async function uploadTokenImage(imagePath, { headless = true, timeoutMs = 30000 
     const fileInput = page.locator(SELECTORS.fileInput).first();
     await fileInput.waitFor({ state: 'attached', timeout: timeoutMs });
 
+    const observedUploadUrls = [];
     let capturedUpload = Promise.resolve({ uri: null, cid: null });
     page.on('response', (res) => {
       if (!isLikelyUploadResponse(res)) {
         return;
       }
 
+      observedUploadUrls.push(`${res.status()} ${res.request().method()} ${res.url()}`);
       capturedUpload = capturedUpload.then(async (previous) => {
         if (previous.uri) {
           return previous;
@@ -203,9 +205,13 @@ async function uploadTokenImage(imagePath, { headless = true, timeoutMs = 30000 
     }
 
     if (!uri) {
+      const observed = observedUploadUrls.length > 0
+        ? ` Проверенные ответы: ${observedUploadUrls.slice(-5).join('; ')}`
+        : ' Подходящих upload/API ответов не было видно.';
       throw new Error(
         'Не удалось поймать ссылку на изображение. ' +
-        'Не найден IPFS URI/CID ни в ответах upload API, ни в src превью.'
+        'Не найден IPFS URI/CID ни в ответах upload API, ни в src превью.' +
+        observed
       );
     }
 
