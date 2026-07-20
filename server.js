@@ -6,7 +6,17 @@ const fs = require('fs');
 const { uploadTokenImage } = require('./upload-to-pons');
 
 const app = express();
-const upload = multer({ dest: os.tmpdir() });
+// Сохраняем файл с оригинальным именем (с расширением!), чтобы Playwright потом
+// передал в форму именно .png / .jpg / .webp / .gif — бэк ponsfamily смотрит на это
+const storage = multer.diskStorage({
+  destination: os.tmpdir(),
+  filename: (req, file, cb) => {
+    const ext = path.extname(file.originalname).toLowerCase() || '.png';
+    const safeName = `upload-${Date.now()}${ext}`;
+    cb(null, safeName);
+  },
+});
+const upload = multer({ storage });
 
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
