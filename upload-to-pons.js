@@ -5,7 +5,10 @@ const fs = require('fs');
 const CREATE_PAGE_URL = 'https://ponsfamily.com/launchpad/create';
 const UPLOAD_ENDPOINT = 'https://ponsfamily.com/api/ipfs/image';
 
-const SELECTORS = { fileInput: 'input.launchpad-file-input' };
+const SELECTORS = {
+  fileInput: 'input.launchpad-file-input',
+  uploadLabel: 'label.launchpad-upload',
+};
 
 async function uploadTokenImage(imagePath, { headless = true, timeoutMs = 60000 } = {}) {
   const browser = await chromium.launch({
@@ -49,66 +52,86 @@ async function uploadTokenImage(imagePath, { headless = true, timeoutMs = 60000 
     await page.waitForLoadState('networkidle', { timeout: timeoutMs }).catch(() => {});
     console.log('   title:', await page.title());
 
-    const bodyText = await page.locator('body').innerText().catch(() => '');
-    if (/just a moment|checking your browser|cloudflare/i.test(bodyText)) {
-      const dir = await saveDebug('cf-challenge');
-      const e = new Error('Cloudflare показывает challenge');
-      e.debugDir = dir;
-      throw e;
-    }
+    console.log('2) Кликаю чекбокс согласия (через реальный click, чтобы React увидел event)…');
+    // Реальный клик по label — так React гарантированно обработает изменение стейта
+    const disclosureLabel = page.locator('label.launchpad-upload').first();
+    const consentCheckbox = page.locator('input[type=checkbox]').first();
 
-    console.log('2) Ищу чекбокс согласия…');
-    const checkboxCandidates = [
-      page.getByRole('checkbox'),
-      page.locator('input[type=checkbox]'),
-      page.locator('.launchpad-disclosure input'),
-      page.locator('.launchpad-disclosure'),
-    ];
-    let checked = false;
-    for (const cand of checkboxCandidates) {
-      const count = await cand.count().catch(() => 0);
-      if (count > 0) {
-        try {
-          await cand.first().check({ force: true, timeout: 3000 });
-          checked = true;
-          break;
-        } catch {
-          try {
-            await cand.first().click({ force: true, timeout: 3000 });
-            checked = true;
-            break;
-          } catch {}
-        }
-      }
+    let consentOk = false;
+    // 1) Пробуем кликнуть по label чекбокса согласия — обычно текст "I understand..." обёрнут в label
+    const consentByText = page.locator('label:has-text("I understand")').first();
+    if (await consentByText.count()) {
+      try {
+        await consentByText.click({ timeout: 3000 });
+        consentOk = true;
+      } catch {}
     }
-    if (!checked) {
+    // 2) Fallback — обычный check через input
+    if (!consentOk && await consentCheckbox.count()) {
+      try {
+        await consentCheckbox.check({ force: true, timeout: 3000 });
+        consentOk = true;
+      } catch {}
+    }
+    if (!consentOk) {
       const dir = await saveDebug('no-checkbox');
-      const e = new Error('Не нашёл чекбокс согласия');
+      const e = new Error('Не смог отметить чекбокс согласия');
       e.debugDir = dir;
       throw e;
     }
     console.log('   чекбокс отмечен');
+    await page.waitForTimeout(500);
 
-    // маленькая пауза — иногда чекбокс отправляет запрос на бэк, который выдаёт токен
-    await page.waitForTimeout(1000);
-
-    console.log('3) Ищу input[type=file] и загружаю файл…');
+    console.log('3) Устанавливаю файл в input…');
     const fileInput = page.locator(SELECTORS.fileInput);
-    const fileInputCount = await fileInput.count();
-    if (fileInputCount === 0) {
+    if (await fileInput.count() === 0) {
       const dir = await saveDebug('no-file-input');
       const e = new Error(`Не нашёл ${SELECTORS.fileInput}`);
       e.debugDir = dir;
       throw e;
     }
-    await fileInput.setInputFiles(path.resolve(imagePath));
-    console.log('   файл передан в input');
+
+    // Читаем файл сами и подсовываем через DataTransfer + dispatchEvent —
+    // это единственный способ, чтобы React 100% увидел изменение input'а
+    const absolutePath = path.resolve(imagePath);
+    const fileBuffer = fs.readFileSync(absolutePath);
+    const fileName = path.basename(absolutePath);
+    // определяем mime-type по расширению
+    const ext = path.extname(fileName).toLowerCase();
+    const mimeByExt = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.gif': 'image/gif' };
+    const mime = mimeByExt[ext] || 'image/png';
+    const base64 = fileBuffer.toString('base64');
+    console.log(`   файл: ${fileName}, ${fileBuffer.length} байт, mime=${mime}`);
+
+    // Способ 1: стандартный setInputFiles
+    await fileInput.setInputFiles(absolutePath);
+
+    // Способ 2 (страховка): через DataTransfer + dispatchEvent,
+    // чтобы гарантированно триггернуть onChange у React-обёртки
+    await page.evaluate(async ({ base64, fileName, mime, selector }) => {
+      const input = document.querySelector(selector);
+      if (!input) return { ok: false, reason: 'no input in DOM' };
+      // Собираем File
+      const binary = atob(base64);
+      const len = binary.length;
+      const bytes = new Uint8Array(len);
+      for (let i = 0; i < len; i++) bytes[i] = binary.charCodeAt(i);
+      const file = new File([bytes], fileName, { type: mime });
+      // Кладём в DataTransfer
+      const dt = new DataTransfer();
+      dt.items.add(file);
+      input.files = dt.files;
+      // Триггерим и change, и input — React слушает разное в зависимости от версии/обёртки
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      return { ok: true, files: input.files.length, first: input.files[0]?.name };
+    }, { base64, fileName, mime, selector: SELECTORS.fileInput });
+    console.log('   файл установлен + change/input события отправлены');
 
     console.log('4) Жду ответ от', UPLOAD_ENDPOINT, '…');
     let capturedUrl = null;
     let capturedCid = null;
     try {
-      // Ловим ЛЮБОЙ ответ (включая 4xx/5xx), не только успешные
       const res = await page.waitForResponse(
         (r) => r.url() === UPLOAD_ENDPOINT && r.request().method() === 'POST',
         { timeout: timeoutMs }
@@ -116,21 +139,12 @@ async function uploadTokenImage(imagePath, { headless = true, timeoutMs = 60000 
       const status = res.status();
       console.log('   статус ответа:', status);
 
-      const responseHeaders = res.headers();
-      console.log('   заголовки ответа:', JSON.stringify(responseHeaders, null, 2));
-
-      const requestHeaders = res.request().headers();
-      console.log('   заголовки запроса:', JSON.stringify(requestHeaders, null, 2));
-
       const bodyText = await res.text().catch(() => '<не удалось прочитать тело>');
       console.log('   тело ответа:', bodyText.slice(0, 1000));
 
       if (status >= 400) {
         const dir = await saveDebug(`upload-${status}`);
-        // сохраняем полное тело ответа и заголовки отдельно
         fs.writeFileSync(`${dir}/response-body.txt`, bodyText);
-        fs.writeFileSync(`${dir}/response-headers.json`, JSON.stringify(responseHeaders, null, 2));
-        fs.writeFileSync(`${dir}/request-headers.json`, JSON.stringify(requestHeaders, null, 2));
         const e = new Error(`Upload вернул ${status}. Тело: ${bodyText.slice(0, 300)}`);
         e.debugDir = dir;
         throw e;
@@ -142,7 +156,7 @@ async function uploadTokenImage(imagePath, { headless = true, timeoutMs = 60000 
         capturedUrl = json.uri || (json.cid ? `ipfs://${json.cid}` : null);
       } catch {}
     } catch (waitErr) {
-      if (waitErr.debugDir) throw waitErr; // уже наша обёрнутая ошибка
+      if (waitErr.debugDir) throw waitErr;
       const dir = await saveDebug('no-upload-response');
       console.error('   запросы к /api за сессию:', requestLog);
       const e = new Error(`Не дождался POST на ${UPLOAD_ENDPOINT}: ${waitErr.message}`);
